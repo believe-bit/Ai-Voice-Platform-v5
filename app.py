@@ -30,6 +30,10 @@ from passlib.hash import bcrypt  # 添加密码哈希支持
 import threading
 import hashlib
 
+STUDENT_IPS_FILE = Path(__file__).with_name('User') / 'student_ips.txt'
+# 在线学生：{ip: sid}
+online_students = {}
+
 
 app = Flask(__name__)
 CORS(app, resources={r"/api/*": {"origins": "*"}})
@@ -56,6 +60,24 @@ USER_DATA_ROOT = Path("/data/huangtianle/Ai-Voice-Platform/User")
 STREAM_ASR_PROC = None          # 子进程句柄
 STREAM_ASR_LOCK = threading.Lock()
 
+
+
+# 类型映射：英文 → 中文
+TYPE_MAP = {
+    "Speech Recognition": "语音识别",
+    "Speech Synthesis": "语音合成"
+}
+
+# 等级映射：英文 → 中文
+LEVEL_MAP = {
+    "Beginner": "初级",
+    "Intermediate": "中级",
+    "Advanced": "高级"
+}
+
+
+# 注册静态文件服务
+app.static_folder = "/data/huangtianle/Ai-Voice-Platform/static"
 # ====== WebSocket 实时 ASR 推流新增 ======
 ASR_LOG_Q = queue.Queue()          # 留给前端轮询备用，可忽略
 STREAM_ASR_THREAD = None           # 读 stdout 线程句柄
@@ -308,30 +330,6 @@ def asr_reader_task():
         # 可选：过滤启动日志
         elif any(phrase in line for phrase in ['正在加载模型', '实时语音识别启动', '请说']):
             pass
-
-def _user_dir(username: str) -> Path:
-    d = USER_ROOT / username
-    d.mkdir(parents=True, exist_ok=True)
-    return d
-
-def _project_meta_file(username: str, proj_dir: str) -> Path:
-    return _user_dir(username) / proj_dir / 'project.json'
-
-def list_projects(username: str):
-    """返回 List[dict] 供前端表格用"""
-    user_dir = _user_dir(username)
-    projects = []
-    for pd in user_dir.iterdir():
-        if pd.is_dir() and (pd / 'project.json').is_file():
-            with open(pd / 'project.json', encoding='utf-8') as f:
-                meta = json.load(f)
-            meta['id'] = pd.name          # 目录名就是 UUID
-            projects.append(meta)
-    return sorted(projects, key=lambda x: x['created_at'], reverse=True)
-
-def save_project_meta(username: str, proj_dir: str, meta: dict):
-    _project_meta_file(username, proj_dir).write_text(
-        json.dumps(meta, ensure_ascii=False, indent=2), encoding='utf-8')
 
 
 SECRET_KEY = '4079ba7c3c6f7edc7e821316c6c086a1a653fe376ca4c0d0cfa229792e4169a2'
@@ -1578,125 +1576,183 @@ def get_user():
 @app.route('/api/projects', methods=['GET'])
 @require_auth()
 def get_projects():
+    username = request.user['username']
+    user_dir = USER_DATA_ROOT / username
+
+    result = []
+    if not user_dir.exists():
+        return jsonify(result)
+
+    for pid_dir in user_dir.iterdir():
+        if pid_dir.is_dir():
+            json_file = pid_dir / "project.json"
+            if json_file.is_file():
+                try:
+                    with open(json_file, 'r', encoding='utf-8') as f:
+                        data = json.load(f)
+                    result.append({
+                        "e_id": data["e_id"],
+                        "e_name": data["e_name"],
+                        "e_type": data["e_type"],
+                        "e_level": data["e_level"],
+                        "e_description": data["e_description"],
+                        "e_list": data["e_list"]
+                    })
+                except Exception as e:
+                    logger.warning(f"读取项目失败 {pid_dir}: {e}")
+                    continue
+
+    # 按 e_id 时间戳倒序（越大越新）
+    result.sort(key=lambda x: x["e_id"], reverse=True)
+    return jsonify(result)
+
+@app.route('/api/projects/<project_id>/json', methods=['GET'])
+@require_auth()
+def get_project_json(project_id):
+    username = request.user['username']
+    user_dir = USER_DATA_ROOT / username
+    project_dir = user_dir / project_id
+    json_file = project_dir / "project.json"
+
+    if not json_file.exists():
+        return jsonify({'error': '项目文件不存在'}), 404
+
     try:
-        client_ip = request.headers.get('X-Forwarded-For', request.remote_addr)
-        logging.debug(f"Projects requested by user: {request.user['username']}, role: {request.user['role']}, IP: {client_ip}")
-        with get_db() as conn:
-            c = conn.cursor()
-            if request.user['role'] == 'admin':
-                c.execute('SELECT id, name, type, level, created_at, guide_path FROM projects')
-            else:
-                c.execute('''
-                    SELECT p.id, p.name, p.type, p.level, p.created_at, p.guide_path
-                    FROM projects p
-                    JOIN distributed_projects dp ON p.id = dp.project_id
-                    WHERE dp.student_ip = ?
-                ''', (client_ip,))
-            projects = c.fetchall()
-            return jsonify([dict(row) for row in projects])
+        with open(json_file, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+        return Response(
+            json.dumps(data, ensure_ascii=False, indent=2),
+            mimetype='application/json',
+            headers={
+                'Content-Disposition': f'inline; filename="{project_id}.json"'
+            }
+        )
     except Exception as e:
-        logging.error(f"Error in /api/projects: {str(e)}")
-        return jsonify({'error': '服务器内部错误'}), 500
+        logger.error(f"读取项目 JSON 失败 {project_id}: {e}")
+        return jsonify({'error': '读取失败'}), 500
+
+@app.route('/api/projects/<project_id>/guide', methods=['PUT'])
+@require_auth('admin')
+def save_project_guide(project_id):
+    data = request.get_json()
+    steps = data.get('steps', [])
+    
+    if not isinstance(steps, list):
+        return jsonify({'error': 'steps 必须是数组'}), 400
+
+    username = request.user['username']
+    user_dir = USER_DATA_ROOT / username
+    project_dir = user_dir / project_id
+    json_file = project_dir / "project.json"
+
+    if not json_file.exists():
+        return jsonify({'error': '项目不存在'}), 404
+
+    try:
+        # 读取原有数据
+        with open(json_file, 'r', encoding='utf-8') as f:
+            project_data = json.load(f)
+
+        # 覆盖 e_list
+        project_data['e_list'] = steps
+
+        # 写回文件
+        with open(json_file, 'w', encoding='utf-8') as f:
+            json.dump(project_data, f, ensure_ascii=False, indent=2)
+
+        return jsonify({'message': '指导书保存成功', 'e_list': steps}), 200
+    except Exception as e:
+        logger.error(f"保存指导书失败 {project_id}: {e}")
+        return jsonify({'error': '保存失败'}), 500
 
 # 创建项目
 @app.route('/api/projects', methods=['POST'])
 @require_auth('admin')
 def create_project():
     data = request.get_json()
-    name = data.get('name')
-    project_type = data.get('type')
-    level = data.get('level')
+    name        = data.get('name')
+    project_type= data.get('type')      # 英文
+    level       = data.get('level')     # 英文
+    description = data.get('description', '')
+    
     if not all([name, project_type, level]):
         return jsonify({'error': '缺少必要字段'}), 400
 
-    username = request.user['username']
-    user_dir = Path(__file__).with_name('User') / username
+    username   = request.user['username']
+    user_dir   = USER_DATA_ROOT / username
+    user_dir.mkdir(parents=True, exist_ok=True)
 
-    with get_db() as conn:
-        c = conn.cursor()
-        created_at = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-        c.execute('INSERT INTO projects (name, type, level, created_at) VALUES (?, ?, ?, ?)',
-                  (name, project_type, level, created_at))
-        project_id = c.lastrowid
-        conn.commit()
+    # 生成唯一项目 ID
+    project_id = f"{int(time.time()*1000)}_{uuid.uuid4().hex[:8]}"
+    project_dir = user_dir / project_id
+    project_dir.mkdir(exist_ok=True)
 
-        # 创建唯一 ID 文件夹
-        project_dir = user_dir / str(project_id)
-        project_dir.mkdir(parents=True, exist_ok=True)
-        logger.info(f"Created project directory: {project_dir}")
+    # 转为中文
+    e_type = TYPE_MAP.get(project_type, project_type)
+    e_level = LEVEL_MAP.get(level, level)
 
-        # 查询完整项目信息返回
-        row = c.execute(
-            'SELECT id, name, type, level, created_at, guide_path FROM projects WHERE id = ?',
-            (project_id,)
-        ).fetchone()
+    # 生成 project.json 的访问链接
+    banner_url = f"http://192.168.1.124:5000/api/projects/{project_id}/json"
 
-        return jsonify(dict(row))
+    # 构造新格式的 JSON 数据
+    project_info = {
+        "e_id": project_id,
+        "e_name": name,
+        "e_type": e_type,
+        "e_level": e_level,
+        "e_description": description,
+        "e_banner": banner_url,
+        "e_list": []
+    }
+
+    json_path = project_dir / "project.json"
+    with open(json_path, 'w', encoding='utf-8') as f:
+        json.dump(project_info, f, ensure_ascii=False, indent=2)
+
+    return jsonify({"e_id": project_id}), 201
 
 # 更新项目
-@app.route('/api/projects/<int:id>', methods=['PUT'])
+@app.route('/api/projects/<project_id>', methods=['PUT'])
 @require_auth('admin')
-def update_project(id):
+def update_project(project_id):
     data = request.get_json()
-    name = data.get('name')
-    project_type = data.get('type')
-    level = data.get('level')
-    if not all([name, project_type, level]):
-        return jsonify({'error': '缺少必要字段'}), 400
-    with get_db() as conn:
-        c = conn.cursor()
-        c.execute('UPDATE projects SET name = ?, type = ?, level = ? WHERE id = ?',
-                  (name, project_type, level, id))
-        if c.rowcount == 0:
-            return jsonify({'error': '项目不存在'}), 404
-        conn.commit()
-        return jsonify({'message': '项目更新成功'})
+    username = request.user['username']
+    json_path = USER_ROOT / username / project_id / "project.json"
+
+    if not json_path.is_file():
+        return jsonify({'error': '项目不存在'}), 404
+
+    with open(json_path, 'r', encoding='utf-8') as f:
+        info = json.load(f)
+
+    # 只允许改这三个字段
+    info['name']        = data.get('name', info['name'])
+    info['type']        = data.get('type', info['type'])
+    info['level']       = data.get('level', info['level'])
+    info['description'] = data.get('description', info.get('description', ''))
+
+    with open(json_path, 'w', encoding='utf-8') as f:
+        json.dump(info, f, ensure_ascii=False, indent=2)
+
+    return jsonify({'message': '项目更新成功'})
 
 # 删除项目
-@app.route('/api/projects/<int:id>', methods=['DELETE'])
+@app.route('/api/projects/<project_id>', methods=['DELETE'])
 @require_auth('admin')
-def delete_project(id):
-    logger.debug(f"Attempting to delete project with ID: {id}")
+def delete_project(project_id):
+    username = request.user['username']
+    user_dir = USER_DATA_ROOT / username
+    project_dir = user_dir / project_id
+
+    if not project_dir.exists() or not project_dir.is_dir():
+        return jsonify({'error': '项目不存在'}), 404
+
     try:
-        with get_db() as conn:
-            c = conn.cursor()
-            c.execute('PRAGMA foreign_keys = ON')
-
-            # 获取 guide_path 和用户名
-            c.execute('SELECT guide_path FROM projects WHERE id = ?', (id,))
-            row = c.fetchone()
-            guide_path = row['guide_path'] if row else None
-
-            # 删除关联记录
-            c.execute('DELETE FROM distributed_projects WHERE project_id = ?', (id,))
-            logger.debug(f"Deleted {c.rowcount} records from distributed_projects")
-
-            # 删除项目
-            c.execute('DELETE FROM projects WHERE id = ?', (id,))
-            if c.rowcount == 0:
-                return jsonify({'error': '项目不存在'}), 404
-
-            conn.commit()
-            logger.info(f"Project ID {id} deleted from database")
-
-        # 删除磁盘上的项目文件夹（即使 guide_path 为空也删）
-        username = request.user['username']
-        user_dir = Path(__file__).with_name('User') / username
-        project_dir = user_dir / str(id)
-
-        if project_dir.exists() and project_dir.is_dir():
-            try:
-                shutil.rmtree(project_dir)
-                logger.info(f"Deleted project directory: {project_dir}")
-            except Exception as e:
-                logger.warning(f"Failed to delete project directory {project_dir}: {e}")
-                # 不中断流程
-
-        return jsonify({'message': '项目删除成功，关联文件已清理'})
-
+        shutil.rmtree(project_dir)  # 递归删除整个文件夹
+        return jsonify({'message': '项目删除成功'}), 200
     except Exception as e:
-        logger.error(f"Delete project error: {str(e)}")
-        return jsonify({'error': str(e)}), 500
+        logger.error(f"删除项目失败 {project_id}: {e}")
+        return jsonify({'error': '删除失败，请检查权限或文件占用'}), 500
 
 # 保存指导书
 @app.route('/api/guides', methods=['POST'])
@@ -1732,7 +1788,7 @@ def save_guide():
         project_dir = user_dir / str(project_id)
         project_dir.mkdir(parents=True, exist_ok=True)
 
-        json_path = project_dir / "guide.json"  # 统一命名
+        json_path = project_dir / "guide.json"
 
         with open(json_path, 'w', encoding='utf-8') as f:
             json.dump(guide_json, f, ensure_ascii=False, indent=2)
@@ -1780,60 +1836,18 @@ def get_guide_content(project_id):
 
 # 获取学生IP
 @app.route('/api/student_ips', methods=['GET'])
-@require_auth('admin')  # ← 改为 JWT 鉴权
+@require_auth('admin')
 def get_student_ips():
     try:
-        with get_db() as conn:
-            c = conn.cursor()
-            c.execute('SELECT ip FROM student_ips')
-            ips = [row['ip'] for row in c.fetchall()]
-            return jsonify({'ips': ips})
+        if not STUDENT_IPS_FILE.exists():
+            return jsonify({'ips': []})
+        with open(STUDENT_IPS_FILE, 'r', encoding='utf-8') as f:
+            ips = [line.strip() for line in f if line.strip()]
+        return jsonify({'ips': ips})
     except Exception as e:
-        return jsonify({'error': str(e)}), 500
+        logger.error(f"获取学生IP失败: {str(e)}")
+        return jsonify({'ips': []})
 
-# 下发项目
-@app.route('/api/projects/<int:id>/distribute', methods=['POST'])
-@require_auth('admin')
-def distribute_project(id):
-    data = request.get_json()
-    ips = data.get('ips', [])
-    if not ips:
-        return jsonify({'error': '未选择学生IP'}), 400
-    with get_db() as conn:
-        c = conn.cursor()
-        c.execute('SELECT id, name, type, level, created_at, guide_path FROM projects WHERE id = ?', (id,))
-        project = c.fetchone()
-        if not project:
-            return jsonify({'error': '项目不存在'}), 404
-        for ip in ips:
-            c.execute('INSERT OR REPLACE INTO distributed_projects (project_id, student_ip) VALUES (?, ?)', (id, ip))
-            # ✅ 用“账号名”代替 IP 当目录名
-            username = request.user['username']          # ← 新增
-            student_dir = Path(__file__).with_name('User') / username   # ← 改这里
-            student_dir.mkdir(parents=True, exist_ok=True)
-            dst_path = student_dir / f'guide_{id}.json'
-            src_path = Path(project['guide_path'])
-            if src_path.exists():
-                shutil.copyfile(src_path, dst_path)
-            else:
-                empty = {
-                    "project_name": project['name'],
-                    "project_type": project['type'],
-                    "project_level": project['level'],
-                    "steps": [{"title": "暂未设计步骤", "content": ""}]
-                }
-                with open(dst_path, 'w', encoding='utf-8') as f:
-                    json.dump(empty, f, ensure_ascii=False, indent=2)
-            socketio.emit('project_distributed', {
-                'id': project['id'],
-                'name': project['name'],
-                'type': project['type'],
-                'level': project['level'],
-                'created_at': project['created_at'],
-                'guide_path': str(dst_path)          # ← 学生端用新路径
-            }, to=ip)
-        conn.commit()
-        return jsonify({'message': '项目下发成功'})
 
 # 学生端读取自己目录下的指导书
 @app.route('/api/student/guide/<int:project_id>', methods=['GET'])
@@ -1854,29 +1868,100 @@ def get_student_guide(project_id):
         logger.exception('get_student_guide error')
         return jsonify({'error': str(e)}), 500
 
+@app.route('/api/distribute', methods=['POST'])
+@require_auth('admin')
+def distribute_project():
+    data = request.get_json()
+    project_id = data.get('project_id')
+    target = data.get('target_ip')  # 格式: "127.0.0.1:5001"
+
+    if not project_id or not target:
+        return jsonify({'error': '缺少 project_id 或 target'}), 400
+
+    try:
+        ip, port_str = target.split(':')
+        port = int(port_str)
+    except:
+        return jsonify({'error': 'target_ip 格式错误，应为 IP:端口'}), 400
+
+    if ip not in online_students or online_students[ip] != port:
+        return jsonify({'error': '该学生不在线'}), 400
+
+    # 读取项目 JSON
+    username = request.user['username']
+    user_dir = USER_DATA_ROOT / username
+    project_dir = user_dir / project_id
+    json_file = project_dir / "project.json"
+
+    if not json_file.exists():
+        return jsonify({'error': '项目不存在'}), 404
+
+    try:
+        with open(json_file, 'r', encoding='utf-8') as f:
+            guide_content = json.load(f)
+    except Exception as e:
+        return jsonify({'error': '读取项目失败'}), 500
+
+    e_id = guide_content.get('e_id')
+    if e_id != project_id:
+        return jsonify({'error': 'e_id 不匹配'}), 400
+
+    # 推送给学生端
+    import requests
+    url = f"http://127.0.0.1:{port}/api/receive-guide"
+    payload = {"e_id": e_id, "guide": guide_content}
+
+    try:
+        response = requests.post(url, json=payload, timeout=10)
+        if response.status_code == 200:
+            return jsonify({'message': f'下发成功至 {target}'}), 200
+        else:
+            return jsonify({'error': f'下发失败: {response.text}'}), 500
+    except Exception as e:
+        return jsonify({'error': f'连接学生端失败: {str(e)}'}), 500
+
 
 # WebSocket 事件
 @socketio.on('connect')
-def handle_connect():
+def handle_connect(auth=None):
     client_ip = request.headers.get('X-Forwarded-For', request.remote_addr)
-    logging.debug(f'客户端连接: {client_ip}')
-    with get_db() as conn:
-        c = conn.cursor()
-        c.execute('INSERT OR IGNORE INTO student_ips (ip) VALUES (?)', (client_ip,))
-        conn.commit()
-
+    if ',' in client_ip:
+        client_ip = client_ip.split(',')[0].strip()
+    logging.info(f'客户端连接: {client_ip}')
+    # 不要注册！等 register_student 事件
 @socketio.on('disconnect')
 def handle_disconnect():
     client_ip = request.headers.get('X-Forwarded-For', request.remote_addr)
-    print(f'[DEBUG] 客户端断开: {client_ip} , sid={request.sid}')
+    if ',' in client_ip:
+        client_ip = client_ip.split(',')[0].strip()
+
+    if client_ip in online_students:
+        del online_students[client_ip]
+        logging.info(f'学生下线: {client_ip}')
+        emit('students_update', [f"{i}:{p}" for i, p in online_students.items()], broadcast=True)
+
+@socketio.on('register_student')
+def register_student(data):
+    ip = data.get('ip')
+    port = data.get('port')
+    if ip and port:
+        online_students[ip] = port
+        logging.info(f"学生注册成功: {ip}:{port}")
+        emit('students_update', [f"{i}:{p}" for i, p in online_students.items()], broadcast=True)
+
+@socketio.on('request_students')
+def handle_request_students():
+    current_list = [f"{i}:{p}" for i, p in online_students.items()]
+    logging.info(f"前端请求学生列表，当前在线: {current_list}")
+    emit('students_update', current_list, broadcast=True)
 
 # 启动时自动初始化数据库
-def init_db_on_startup():
-    try:
-        init_db()
-        logger.info("Database initialized successfully on startup")
-    except Exception as e:
-        logger.error(f"Failed to initialize database on startup: {str(e)}")
+# def init_db_on_startup():
+#     try:
+#         init_db()
+#         logger.info("Database initialized successfully on startup")
+#     except Exception as e:
+#         logger.error(f"Failed to initialize database on startup: {str(e)}")
 
 
 if __name__ == '__main__':
@@ -1884,8 +1969,5 @@ if __name__ == '__main__':
     eventlet.monkey_patch()
 
     print("🚀 启动 Flask + SocketIO 服务...")
-    init_db_on_startup()
-    print("✅ 数据库初始化完成")
-
     print("📡 正在监听 0.0.0.0:5000...")
     socketio.run(app, host='0.0.0.0', port=5000, debug=True)
