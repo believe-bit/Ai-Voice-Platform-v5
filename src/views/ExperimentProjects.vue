@@ -9,18 +9,19 @@
     </el-button>
     <!-- 项目列表表格 -->
     <el-table :data="projects" style="width: 100%" border>
-      <el-table-column prop="name" label="项目名称" />
-      <el-table-column prop="type" label="实验类型" />
-      <el-table-column prop="level" label="等级" />
-      <el-table-column prop="created_at" label="创建时间" />
+      <el-table-column prop="e_name" label="项目名称" />
+      <el-table-column prop="e_type" label="实验类型" />
+      <el-table-column prop="e_level" label="等级" />
+      <el-table-column prop="e_description" label="项目描述" width="200" />
       <!-- 管理员操作列 -->
       <el-table-column label="操作" v-if="isAdmin">
         <template #default="{ row }">
           <el-button type="primary" size="small" @click="openDesignModal(row)">设计实验</el-button>
           <el-button type="success" size="small" @click="openDistributeModal(row)">下发实验</el-button>
+          <el-button type="warning" size="small" @click="handleRecycleProject(row.e_id)">回收实验</el-button>
           <el-button type="info" size="small" @click="enterExperiment(row)">进入实验</el-button>
           <el-button type="warning" size="small" @click="editProject(row)">编辑</el-button>
-          <el-button type="danger" size="small" @click="handleDeleteProject(row.id)">删除</el-button>
+          <el-button type="danger" size="small" @click="handleDeleteProject(row.e_id)">删除</el-button>
         </template>
       </el-table-column>
       <!-- 学生操作列 -->
@@ -49,6 +50,15 @@
             <el-option label="中级" value="Intermediate"></el-option>
             <el-option label="高级" value="Advanced"></el-option>
           </el-select>
+        </el-form-item>
+        <el-form-item label="项目描述" prop="description">
+          <el-input
+            v-model="projectForm.description"
+            type="textarea"
+            :rows="3"
+            placeholder="请输入项目描述（可选）"
+            clearable
+          ></el-input>
         </el-form-item>
       </el-form>
       <template #footer>
@@ -84,17 +94,22 @@
     <!-- 下发实验模态框 -->
     <el-dialog title="下发实验" v-model="showDistributeModal" width="30%">
       <el-form :model="distributeForm" ref="distributeFormRef">
-        <el-form-item label="选择学生IP" prop="ips" :rules="[{ required: true, message: '请选择学生IP', trigger: 'change' }]">
-          <el-select v-model="distributeForm.ips" multiple placeholder="请选择学生IP" clearable>
-            <el-option v-for="ip in availableIPs" :key="ip" :label="ip" :value="ip"></el-option>
+        <el-form-item label="选择学生 IP" prop="ip">
+          <el-select v-model="distributeForm.ip" placeholder="请选择在线学生" style="width: 100%">
+            <el-option
+              v-for="ip in availableIPs"
+              :key="ip"
+              :label="ip"
+              :value="ip"
+            />
           </el-select>
         </el-form-item>
       </el-form>
       <template #footer>
-        <span class="dialog-footer">
-          <el-button @click="showDistributeModal = false">取消</el-button>
-          <el-button type="primary" @click="distributeProject">确定</el-button>
-        </span>
+        <el-button @click="showDistributeModal = false">取消</el-button>
+        <el-button type="primary" @click="distributeProject" :loading="isProcessing">
+          确认下发
+        </el-button>
       </template>
     </el-dialog>
   </div>
@@ -116,6 +131,11 @@ import api, {
 import io from 'socket.io-client';
 import { API_BASE_URL } from '@/api/index.js';
 
+const socket = io('http://192.168.1.124:5000', {
+  transports: ['websocket'],
+  path: '/socket.io'  // 关键！flask-socketio 默认路径
+});
+
 export default {
   name: 'ExperimentProjects',
   setup() {
@@ -130,6 +150,7 @@ export default {
       name: '',
       type: '',
       level: '',
+      description: '',
     });
     const projectFormRef = ref(null);
     const showDesignModal = ref(false);
@@ -184,54 +205,47 @@ export default {
 
     // 打开创建模态框并重置表单
     const openCreateModal = () => {
-      projectForm.value = { name: '', type: '', level: '' };
       editMode.value = false;
-      if (projectFormRef.value) {
-        projectFormRef.value.resetFields();
-      }
+      currentProjectId.value = null;
+      projectForm.value = { name: '', type: '', level: '', description: '' };
       showCreateModal.value = true;
-      console.log('Create modal opened, projectForm:', projectForm.value);
     };
 
     onMounted(async () => {
-      console.log('=== 即将调用 getUser ===');
-      let userRes;
       try {
-        userRes = await getUser();
+        const userRes = await getUser();
         console.log('getUser 返回：', userRes);
-      } catch (err) {
-        console.error('getUser 抛出错误：', err);
-        console.error('错误详情：', err.message, err.response);
-        ElMessage.error('加载用户身份失败');
-        return;
-      }
+        const role = userRes.data.role;
+        isAdmin.value = role === 'admin';
 
-      // 关键：设置身份 + 加载项目 + 加载 IP
-      const role = userRes.data.role;
-      localStorage.setItem('userRole', role);
-      isAdmin.value = role === 'admin';
-      console.log('当前角色：', role, 'isAdmin=', isAdmin.value);
+        await loadProjects();
 
-      try {
-        const projRes = await getProjects();
-        projects.value = projRes.data || [];
-        if (isAdmin.value) {
-          try {
-            const ipRes = await getStudentIPs();
-            availableIPs.value = ipRes.data.ips || [];
-          } catch (e) {
-            console.error('获取学生IP失败:', e);
-            // 不中断主流程
-            availableIPs.value = [];
-          }
-        }
+        // 监听 WebSocket 在线学生更新
+        socket.on('students_update', (ips) => {
+          availableIPs.value = ips;
+          console.log('收到在线学生：', ips);
+        });
+
+        // 可选：主动请求一次最新列表
+        socket.emit('request_students');
       } catch (e) {
-        console.error('加载项目/学生IP 失败：', e);
-        ElMessage.error('加载失败：' + (e.response?.data?.error || e.message));
+        console.error('初始化失败', e);
+        ElMessage.error('登录状态异常');
       }
     });
 
-    // 提交项目
+    // 加载项目列表
+    const loadProjects = async () => {
+      try {
+        const { data } = await getProjects();
+        projects.value = data || [];
+      } catch (error) {
+        console.error('加载项目失败', error);
+        ElMessage.error('加载项目失败');
+      }
+    };
+
+    // 提交项目（创建 + 编辑，都传 description）
     const submitProject = async () => {
       if (!projectFormRef.value) {
         console.error('projectFormRef is not defined');
@@ -240,20 +254,40 @@ export default {
       try {
         await projectFormRef.value.validate();
         console.log('Submitting projectForm:', projectForm.value);
+
         if (editMode.value) {
-          await updateProject(currentProjectId.value, projectForm.value);
-          projects.value = projects.value.map((p) =>
-            p.id === currentProjectId.value ? { ...p, ...projectForm.value } : p
+          // 编辑项目：传 name, type, level, description
+          await updateProject(currentProjectId.value, {
+            name: projectForm.value.name,
+            type: projectForm.value.type,
+            level: projectForm.value.level,
+            description: projectForm.value.description
+          });
+          // 更新本地列表
+          projects.value = projects.value.map(p =>
+            p.id === currentProjectId.value
+              ? { ...p, ...projectForm.value }
+              : p
           );
           ElMessage.success('项目更新成功');
         } else {
-          const response = await createProject(projectForm.value);
+          // 创建项目：传完整对象
+          const response = await createProject({
+            name: projectForm.value.name,
+            type: projectForm.value.type,
+            level: projectForm.value.level,
+            description: projectForm.value.description
+          });
           projects.value.push(response.data);
           ElMessage.success('项目创建成功');
         }
+
+        // 关闭弹窗 + 重置表单（包括 description）
         showCreateModal.value = false;
-        projectForm.value = { name: '', type: '', level: '' };
-        projectFormRef.value.resetFields();
+        projectForm.value = { name: '', type: '', level: '', description: '' };
+        if (projectFormRef.value) {
+          projectFormRef.value.resetFields();
+        }
         editMode.value = false;
       } catch (error) {
         console.error('Submit project error:', error.response || error);
@@ -264,88 +298,76 @@ export default {
     // 编辑项目
     const editProject = (project) => {
       editMode.value = true;
-      currentProjectId.value = project.id;
-      projectForm.value = { ...project };
+      currentProjectId.value = project.e_id;
+      projectForm.value = {
+        name: project.e_name,
+        type: project.e_type,
+        level: project.e_level,
+        description: project.e_description || ''
+      };
       showCreateModal.value = true;
-      console.log('Edit project, projectForm:', projectForm.value);
     };
 
     // 删除项目
     const isProcessing = ref(false); // 移到 setup 作用域，确保状态持久
 
-    const handleDeleteProject = async (id) => {
-      if (isProcessing.value) return;
-      isProcessing.value = true;
+    // 删除项目
+    const handleDeleteProject = async (projectId) => {
+      if (!projectId) return;
 
       try {
-        await ElMessageBox.confirm('确定删除此项目？', '提示', { type: 'warning' });
+        const result = await ElMessageBox.confirm(
+          '确定要删除此实验项目吗？删除后无法恢复！',
+          '警告',
+          {
+            confirmButtonText: '确定',
+            cancelButtonText: '取消',
+            type: 'warning'
+          }
+        );
 
-        projects.value = projects.value.filter(p => p.id !== id);
-
-        const response = await deleteProject(id);  // 正确调用 API
-
-        if (response.status === 200) {
+        if (result === 'confirm') {
+          await api.delete(`/projects/${projectId}`);
           ElMessage.success('项目删除成功');
+          await loadProjects();  // 关键：重新加载列表
         }
-
-        const { data } = await getProjects();
-        projects.value = data || [];
-
-      } catch (e) {
-        console.error('Delete error:', e);
-
-        let errorMsg = '删除失败：未知错误';
-        if (e.response) {
-          const status = e.response.status;
-          const msg = e.response.data?.error || e.message;
-          if (status === 401) errorMsg = '未授权，请重新登录';
-          else if (status === 403) errorMsg = '无管理员权限';
-          else if (status === 404) errorMsg = '项目不存在';
-          else errorMsg = `删除失败：${msg}`;
-        } else if (e !== 'cancel') {
-          errorMsg = '网络错误';
+      } catch (error) {
+        if (error !== 'cancel') {
+          ElMessage.error('删除失败: ' + (error.response?.data?.error || error.message));
         }
+      }
+    };
 
-        ElMessage.error(errorMsg);
+    // 回收实验
+    const handleRecycleProject = async (projectId) => {
+      try {
+        await ElMessageBox.confirm(
+          '确定要回收该实验吗？学生端将删除本地项目文件！',
+          '警告',
+          { confirmButtonText: '确定', cancelButtonText: '取消', type: 'warning' }
+        );
 
-        try {
-          const { data } = await getProjects();
-          projects.value = data || [];
-        } catch (fetchError) {
-          ElMessage.error('无法刷新项目列表');
+        await api.post(`/projects/${projectId}/recycle`);
+        ElMessage.success('回收指令已发送');
+      } catch (error) {
+        if (error !== 'cancel') {
+          ElMessage.error('回收失败: ' + (error.response?.data?.error || error.message));
         }
-
-      } finally {
-        isProcessing.value = false;
       }
     };
 
 
     // 打开设计实验模态框
-    const openDesignModal = async (project) => {
-      currentProjectId.value = project.id
-
-      if (project.guide_path) {
-        try {
-          const res = await api.get(`/guides/${project.id}/content`)
-          guideForm.value = {
-            project_id: project.id,
-            steps: res.data.steps?.length ? res.data.steps : [{ title: '', content: '' }]
-          }
-        } catch (e) {
-          console.error('回显指导书失败', e)
-          guideForm.value = {
-            project_id: project.id,
-            steps: [{ title: '', content: '' }]
-          }
-        }
-      } else {
-        guideForm.value = {
-          project_id: project.id,
-          steps: [{ title: '', content: '' }]
-        }
+    const openDesignModal = (project) => {
+      currentProjectId.value = project.e_id;
+      guideForm.value.steps = (project.e_list || []).map(item => ({
+        title: item.title || '',
+        content: item.content || ''
+      }));
+      if (guideForm.value.steps.length === 0) {
+        addStep(); // 至少一个步骤
       }
-      showDesignModal.value = true
+      showDesignModal.value = true;
     };
 
     // 添加指导书步骤
@@ -360,26 +382,22 @@ export default {
 
     // 保存指导书（异步 + loading）
     const saveGuide = async () => {
-      if (!guideFormRef.value) return;
-      saveLoading.value = true;        // 打开 loading
       try {
         await guideFormRef.value.validate();
-        if (!guideForm.value.steps.every(s => s.title && s.content)) {
-          ElMessage.error('请确保所有步骤的标题和内容不为空');
-          return;
-        }
-        // 3. 调接口（注意是 saveGuideAPI，不是自己）
-        const res = await saveGuideAPI(guideForm.value);
-        projects.value = projects.value.map(p =>
-          p.id === guideForm.value.project_id ? { ...p, guide_path: res.data.guide_path } : p
-        );
+        const steps = guideForm.value.steps.map(s => ({
+          title: s.title,
+          content: s.content
+        }));
+
+        await api.put(`/projects/${currentProjectId.value}/guide`, { steps });
+        
         ElMessage.success('指导书保存成功');
         showDesignModal.value = false;
-        guideFormRef.value.resetFields();
-      } catch (e) {
-        ElMessage.error('保存失败：' + (e.message || '未知错误'));
-      } finally {
-        saveLoading.value = false;     // 无论成功失败都关闭
+        await loadProjects();  // 刷新列表
+      } catch (error) {
+        if (error !== 'cancel') {
+          ElMessage.error('保存失败: ' + (error.response?.data?.error || error.message));
+        }
       }
     };
 
@@ -425,29 +443,30 @@ export default {
 
     // 打开下发实验模态框
     const openDistributeModal = (project) => {
-      currentProjectId.value = project.id;
-      distributeForm.value.ips = [];
+      currentProjectId.value = project.e_id;  // 使用 e_id
+      distributeForm.value.ip = '';
       showDistributeModal.value = true;
     };
 
     // 下发项目
     const distributeProject = async () => {
-      console.log('[1] 进入函数');          // 断点 1
-      if (!distributeFormRef.value) return;
+      if (!distributeForm.value.ip) {
+        ElMessage.warning('请选择下发目标');
+        return;
+      }
+
       try {
-        await distributeFormRef.value.validate();
-        console.log('[2] 表单校验通过');     // 断点 2
-
-        console.log('[3] 准备调接口', currentProjectId.value, distributeForm.value);
-        const res = await api.post(`/projects/${currentProjectId.value}/distribute`, distributeForm.value);
-        console.log('[4] 接口返回', res);
-
-        ElMessage.success('项目下发成功');
+        isProcessing.value = true;
+        await api.post('/distribute', {
+          project_id: currentProjectId.value,
+          target_ip: distributeForm.value.ip  // ← 正确字段名 + 值是 "127.0.0.1:5001"
+        });
+        ElMessage.success('实验下发成功');
         showDistributeModal.value = false;
-        distributeFormRef.value.resetFields();
       } catch (error) {
-        console.error('[5] 捕获错误', error);
-        ElMessage.error('下发项目失败: ' + (error.message || '未知错误'));
+        ElMessage.error('下发失败: ' + (error.response?.data?.error || error.message));
+      } finally {
+        isProcessing.value = false;
       }
     };
 
@@ -478,6 +497,12 @@ export default {
       }
     };
 
+    // === 精准插入：监听主服务器广播的在线学生 ===
+    socket.on('students_update', (ips) => {
+      availableIPs.value = ips;
+      console.log('收到在线学生：', ips);  // 调试用
+    });
+
     return {
       projects,
       isAdmin,
@@ -507,6 +532,7 @@ export default {
       viewGuide,
       enterExperiment,
       isProcessing,
+      handleRecycleProject,
     };
   },
 };
